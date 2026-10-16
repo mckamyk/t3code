@@ -27,4 +27,5 @@ export const REACT_COMPILED_FILES = [
 export const REACT_COMPILED_FILES_PENDING_LINT = [
   "apps/web/src/components/ChatView.tsx",
   "apps/web/src/components/Sidebar.tsx",
+  "apps/web/src/components/chat/ChatComposer.tsx",
 ] as const;
