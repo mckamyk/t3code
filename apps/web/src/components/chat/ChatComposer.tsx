@@ -5703,6 +5703,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     event.preventDefault();
     event.stopPropagation();
   };
+  // The editor is memoized; fresh closures here re-render it on every parent
+  // render, which during a stream is every delta.
+  const onComposerPasteStable = useStableCallback(onComposerPaste);
+  const onComposerCommandKeyStable = useStableCallback(onComposerCommandKey);
+  const isPathQueryActiveStable = useStableCallback(
+    () => resolveActiveComposerTrigger().trigger?.kind === "path",
+  );
 
   const insertComposerText = (
     text: string,
@@ -7098,9 +7105,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     editorRef={composerEditorRef}
                     richTextEnabled={settings.composerRichTextEnabled}
                     literalText={isLiteralPendingAnswer}
-                    isPathQueryActive={() =>
-                      resolveActiveComposerTrigger().trigger?.kind === "path"
-                    }
+                    isPathQueryActive={isPathQueryActiveStable}
                     value={
                       isComposerApprovalState
                         ? ""
@@ -7126,13 +7131,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     )}
                     onChange={onPromptChangeStable}
                     onVisibleSelectionChange={expandComposerForEditorChangeStable}
-                    onCommandKeyDown={onComposerCommandKey}
+                    onCommandKeyDown={onComposerCommandKeyStable}
                     onPageScrollKeyDown={onPageScrollKeyDown}
                     onPageScrollKeyUp={onPageScrollKeyUp}
                     onPageScrollRelease={onPageScrollRelease}
                     onCitationSubmitAndSend={submitCitationAndSendStable}
                     onCitationDraftSave={saveCitationDraftToPromptStable}
-                    onPaste={onComposerPaste}
+                    onPaste={onComposerPasteStable}
                     placeholder={
                       isComposerApprovalState
                         ? "Resolve this approval request to continue"
