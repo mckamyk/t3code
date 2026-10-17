@@ -487,7 +487,11 @@ export const layer: Layer.Layer<
         runId,
         signal: "post-merge-continuation",
       });
-      const continuationNotice = (message: string, now: DateTime.Utc): OrchestrationV2TurnItem => ({
+      const continuationNotice = (
+        message: string,
+        now: DateTime.Utc,
+        divider?: Extract<OrchestrationV2TurnItem, { type: "system_notice" }>["divider"],
+      ): OrchestrationV2TurnItem => ({
         id: continuationNoticeId,
         threadId: projection.thread.id,
         runId,
@@ -506,6 +510,7 @@ export const layer: Layer.Layer<
         type: "system_notice",
         title: "Post-merge continuation",
         message,
+        ...(divider === undefined ? {} : { divider }),
         status: "completed",
         startedAt: now,
         completedAt: now,
@@ -533,6 +538,7 @@ export const layer: Layer.Layer<
                       payload: continuationNotice(
                         `PR #${number} merged. Preparing continuation…`,
                         now,
+                        { label: `Preparing continuation after PR #${number}` },
                       ),
                     },
                   ],
@@ -663,7 +669,11 @@ export const layer: Layer.Layer<
           threadId: currentThread.id,
           runId,
           occurredAt: now,
-          payload: continuationNotice(continuation.success.notice, now),
+          payload: continuationNotice(
+            continuation.success.notice,
+            now,
+            continuation.success.divider,
+          ),
         });
         if (events.length > 0) {
           const written = yield* eventSink.writeIfRunCurrent({

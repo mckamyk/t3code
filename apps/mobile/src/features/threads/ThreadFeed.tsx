@@ -1091,6 +1091,24 @@ function renderFeedEntry(
     );
   }
 
+  const notice =
+    entry.type === "activity-group" && entry.activities.length === 1
+      ? entry.activities[0]?.projectedItem.item
+      : undefined;
+  if (notice?.type === "system_notice" && notice.divider !== undefined) {
+    return (
+      <ThreadContextDivider
+        label={notice.divider.label}
+        icon="arrow.left.arrow.right"
+        iconColor={iconSubtleColor}
+      >
+        {notice.divider.detail === undefined ? null : (
+          <Text className="shrink text-xs text-foreground-muted">{notice.divider.detail}</Text>
+        )}
+      </ThreadContextDivider>
+    );
+  }
+
   if (entry.type === "activity-group" && isContextHandoffActivityGroup(entry)) {
     return (
       <ThreadHandoffRow

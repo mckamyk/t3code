@@ -1095,6 +1095,7 @@ effectIt.effect(
         continuation: {
           branch: "feature/next",
           notice: "PR #17 merged. Continuing on feature/next from origin/main.",
+          divider: { label: "Continued after PR #17", detail: "feature/next · from main" },
           context:
             "PR #17 merged. Old branch feature/restore; new branch feature/next; fetched base abc123. Earlier conversation describes the old checkout. Inspect current files.",
           previousPullRequest: {
@@ -1137,6 +1138,11 @@ effectIt.effect(
               item.type === "system_notice" && item.message.includes("Continuing on feature/next"),
           ),
       ).toBe(true);
+      expect(
+        harness.projection().turnItems.find((item) => item.type === "system_notice"),
+      ).toMatchObject({
+        divider: { label: "Continued after PR #17", detail: "feature/next · from main" },
+      });
       const input = harness.startRootRun.mock.calls[0]?.[0];
       expect(input).toBeDefined();
       if (input === undefined) return;

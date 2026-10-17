@@ -111,6 +111,22 @@ describe("orchestration V2 wire projection", () => {
     expect(projectDomainEventForWire(event)).toEqual(event);
   });
 
+  it("preserves continuation dividers through wire and persisted JSON contracts", () => {
+    const item = {
+      ...base,
+      type: "system_notice" as const,
+      message: "PR #17 merged. Continuing on feature/next from origin/main.",
+      divider: { label: "Continued after PR #17", detail: "feature/next · from main" },
+    };
+    const live = decodeTurnItem(projectTurnItemForWire(item));
+    const decoded = decodeTurnItem(decodeTurnItemJson(encodeTurnItemJson(live)));
+    expect(decoded).toMatchObject({
+      type: "system_notice",
+      message: item.message,
+      divider: item.divider,
+    });
+  });
+
   it("keeps transcript bodies out of shell rows", () => {
     const now = DateTime.makeUnsafe("2026-08-13T00:00:00.000Z");
     const threadId = ThreadId.make("thread-shell-budget");

@@ -7098,6 +7098,10 @@ it.effect.each(["squash", "rebase", "merge"] as const)(
       const fixture = yield* continuationFixture(merge);
       const result = yield* fixture.prepare();
       expect(result.branch).toBe("feature/first-continue-17");
+      expect(result.divider).toEqual({
+        label: "Continued after PR #17",
+        detail: "feature/first-continue-17 · from main",
+      });
       expect((yield* runGit(fixture.cwd, ["rev-parse", "HEAD"])).stdout.trim()).toBe(fixture.tip);
       expect((yield* runGit(fixture.cwd, ["rev-parse", "feature/first"])).stdout.trim()).toBe(
         fixture.mergedHead,
@@ -7157,6 +7161,10 @@ it.effect.each(["index", "dirty", "untracked", "commit", "diverged"] as const)(
       const result = yield* f.prepare();
       expect(result.branch).toBeUndefined();
       expect(result.context).toContain("PREPARATION REQUIRED BEFORE IMPLEMENTATION");
+      expect(result.divider).toEqual({
+        label: "Continuing after PR #17",
+        detail: "Existing work preserved; preparation required",
+      });
       expect(result.context).toContain(f.tip);
       expect(result.context).toContain(
         work === "diverged" ? "ambiguous or rewritten" : "is an ancestor of HEAD",

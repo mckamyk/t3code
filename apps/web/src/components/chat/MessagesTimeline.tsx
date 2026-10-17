@@ -3447,6 +3447,19 @@ const WorkGroupSection = memo(function WorkGroupSection({
   );
 
   if (nonEmptyEntries.length === 0) return null;
+  const item = nonEmptyEntries.length === 1 ? nonEmptyEntries[0]?.projectedItem?.item : undefined;
+  if (item?.type === "system_notice" && item.divider !== undefined) {
+    return (
+      <TimelineSystemDivider
+        label={item.divider.label}
+        detail={
+          item.divider.detail === undefined ? null : (
+            <span className="min-w-0 break-all">{item.divider.detail}</span>
+          )
+        }
+      />
+    );
+  }
   if (isExpandedToolGroup && nonEmptyEntries.every((entry) => entry.itemType === "reasoning")) {
     return <ReasoningTraceContent entries={nonEmptyEntries} />;
   }

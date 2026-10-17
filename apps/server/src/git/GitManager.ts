@@ -3266,6 +3266,10 @@ export const make = Effect.gen(function* () {
       return {
         previousPullRequest,
         notice: `PR #${pr.number} merged. Preserving existing work; continuation needs agent preparation.`,
+        divider: {
+          label: `Continuing after PR #${pr.number}`,
+          detail: "Existing work preserved; preparation required",
+        },
         context: `PREPARATION REQUIRED BEFORE IMPLEMENTATION: PR #${pr.number} (${pr.url}) merged from ${checkout.branch} at ${pr.headSha}. The checkout, commits, index, staged and untracked files were preserved. Fetched origin/${defaultBranch} at ${baseSha}. First inspect current files and existing follow-up work. Reconcile only follow-up changes onto a unique fresh branch based on that fetched SHA, in this same worktree, preserving ${checkout.branch}. ${boundary.exitCode === 0 ? `The exact merged head ${pr.headSha} is an ancestor of HEAD; it may be used as the boundary for follow-up commits after inspection.` : "History is ambiguous or rewritten. Inspect it; do not guess which commits to replay."} Never infer landed changes using git cherry or patch IDs. Preserve pending files and staging, resolve conflicts and test before addressing the queued user request. Do not commit, push or create a PR as part of preparation. Earlier conversation describes the old checkout; inspect the current files. Update the thread branch binding after switching.`,
       };
     }

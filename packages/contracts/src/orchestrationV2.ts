@@ -1319,6 +1319,11 @@ const OrchestrationV2SecretRequestFields = {
   secretStatus: OrchestrationV2SecretRequestStatus,
 } as const;
 
+const SystemNoticeDivider = Schema.Struct({
+  label: Schema.String,
+  detail: Schema.optional(Schema.String),
+});
+
 export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -1436,6 +1441,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("system_notice"),
     message: Schema.String,
+    divider: Schema.optional(SystemNoticeDivider),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -2191,6 +2197,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("system_notice"),
     message: Schema.String,
+    divider: Schema.optional(SystemNoticeDivider),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
