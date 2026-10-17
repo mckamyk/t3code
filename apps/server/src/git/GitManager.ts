@@ -3324,7 +3324,7 @@ export const make = Effect.gen(function* () {
         "The checkout changed before switching. Existing work was preserved; retry preparation.",
       );
     }
-    yield* continuationGit(cwd, ["switch", next.branch]);
+    yield* continuationGit(cwd, ["switch", "--no-overwrite-ignore", next.branch]);
     const switched = yield* readCheckout;
     if (switched.branch !== next.branch || switched.head !== next.baseSha)
       return yield* blocked(

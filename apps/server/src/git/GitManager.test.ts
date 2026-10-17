@@ -7175,6 +7175,34 @@ it.effect.each(["index", "dirty", "untracked", "commit", "diverged"] as const)(
     }).pipe(Effect.provide(layerGitManagerTest)),
 );
 
+it.effect("preserves ignored local files that the fetched base starts tracking", () =>
+  Effect.gen(function* () {
+    const f = yield* continuationFixture();
+    const file = "local-settings.json";
+    yield* runGit(f.root, ["switch", "--detach", f.tip]);
+    NodeFS.writeFileSync(NodePath.join(f.root, file), "remote settings\n");
+    yield* runGit(f.root, ["add", file]);
+    yield* runGit(f.root, ["commit", "-m", "Track shared settings"]);
+    yield* runGit(f.root, ["push", "origin", "HEAD:main"]);
+    NodeFS.appendFileSync(NodePath.join(f.root, ".git", "info", "exclude"), `\n${file}\n`);
+    NodeFS.writeFileSync(NodePath.join(f.cwd, file), "local settings to preserve\n");
+    expect(
+      (yield* runGit(f.cwd, ["status", "--porcelain=v1", "--untracked-files=all"])).stdout,
+    ).toBe("");
+
+    const result = yield* f.prepare().pipe(Effect.result);
+
+    expect(result._tag).toBe("Failure");
+    expect(NodeFS.readFileSync(NodePath.join(f.cwd, file), "utf8")).toBe(
+      "local settings to preserve\n",
+    );
+    expect((yield* runGit(f.cwd, ["branch", "--show-current"])).stdout.trim()).toBe(
+      "feature/first",
+    );
+    expect((yield* runGit(f.cwd, ["rev-parse", "HEAD"])).stdout.trim()).toBe(f.mergedHead);
+  }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
 it.effect.each(["shared", "background", "terminal", "fetch", "base", "fork", "identity"] as const)(
   "leaves the checkout untouched when continuation is blocked by %s",
   (reason) =>
@@ -7276,7 +7304,7 @@ it.effect.each(["branch", "switch"])(
       const reached = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
       const gated = (yield* f.make({
-        matches: (args) => args[0] === step && args[1] === "feature/first-continue-17",
+        matches: (args) => args[0] === step && args.includes("feature/first-continue-17"),
         reached,
         release,
       })).manager;
