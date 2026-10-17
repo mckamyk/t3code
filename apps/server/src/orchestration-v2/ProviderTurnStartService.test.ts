@@ -3,6 +3,7 @@ import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
 import {
   CheckpointScopeId,
+  GitManagerError,
   MessageId,
   NodeId,
   ProviderSessionId,
@@ -102,7 +103,11 @@ it("does not commit running state when inherited background routing cannot be re
         IdAllocator.layer,
         Path.layer,
         FileSystem.layerNoop({ exists: () => Effect.succeed(false) }),
-        Layer.mock(GitWorkflow.GitWorkflowService)({ pruneWorktrees, createWorktree }),
+        Layer.mock(GitWorkflow.GitWorkflowService)({
+          pruneWorktrees,
+          createWorktree,
+          prepareThreadContinuation: () => Effect.succeed({}),
+        }),
         Layer.mock(ProjectService.ProjectService)({
           getById: () =>
             Effect.succeed(
@@ -177,6 +182,9 @@ function makeLocalCommandHarness(input: {
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
   readonly failReadsAfterRunning?: boolean;
+  readonly deliverProviderTurn?: boolean;
+  readonly continuation?: import("../git/continuationReceipt.ts").ThreadContinuationResult;
+  readonly continuationFailure?: GitManagerError;
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
   const threadId = ThreadId.make("thread-native-account-command");
@@ -245,7 +253,23 @@ function makeLocalCommandHarness(input: {
       projectId: ProjectId.make("project-native-account-command"),
       branch: input.worktreePath === undefined ? null : "feature/restore",
       worktreePath: input.worktreePath ?? null,
-    } as OrchestrationV2ThreadProjection["thread"],
+      title: "Continuation test",
+      providerInstanceId: newInstanceId,
+      modelSelection: run.modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      forkedFrom: null,
+      createdBy: "user",
+      creationSource: "web",
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: null,
+      settledAt: null,
+      settledOverride: null,
+      lastVisitedAt: null,
+      deletedAt: null,
+    },
     runs: [
       ...(input.previousNativeSession
         ? [
@@ -400,6 +424,14 @@ function makeLocalCommandHarness(input: {
       ),
     ensureThread: () => Effect.succeed(providerThread),
   };
+  const nativeStartTurn = vi.fn(
+    (_input: ProviderAdapter.ProviderAdapterV2TurnInput) => Effect.void,
+  );
+  const prepareContinuation = vi.fn(() =>
+    input.continuationFailure !== undefined
+      ? Effect.fail(input.continuationFailure)
+      : Effect.succeed(input.continuation ?? {}),
+  );
   const open = vi.fn(() =>
     input.interruptOpen === true
       ? Effect.interrupt
@@ -421,7 +453,7 @@ function makeLocalCommandHarness(input: {
                   ),
                 ),
               )
-            : input.failReadsAfterRunning === true
+            : input.failReadsAfterRunning === true || input.deliverProviderTurn === true
               ? Effect.succeed({
                   driver: providerThread.driver,
                   providerSession: {
@@ -437,13 +469,15 @@ function makeLocalCommandHarness(input: {
                     lastError: null,
                   },
                   ensureThread: () => Effect.succeed(providerThread),
+                  resumeThread: () => Effect.succeed(providerThread),
+                  startTurn: nativeStartTurn,
                 } as never)
               : Effect.die("A local command must not open a native session."),
   );
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
   >(() =>
-    input.failReadsAfterRunning === true
+    input.failReadsAfterRunning === true || input.deliverProviderTurn === true
       ? Effect.void
       : Effect.die("A local command must not start a native turn."),
   );
@@ -521,6 +555,7 @@ function makeLocalCommandHarness(input: {
           ? FileSystem.layerNoop({ exists: () => Effect.succeed(true) })
           : Layer.succeed(FileSystem.FileSystem, input.fileSystem),
         Layer.mock(GitWorkflow.GitWorkflowService)({
+          prepareThreadContinuation: prepareContinuation,
           pruneWorktrees: () => Effect.void,
           createWorktree,
         }),
@@ -530,6 +565,7 @@ function makeLocalCommandHarness(input: {
         }),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
           getThreadRecords,
+          getThread: () => Effect.succeed(projection.thread),
           getTurnStartContext,
           getRuntimeRecoveryProjection: () =>
             Effect.as(failReadIfRunning, {
@@ -541,12 +577,14 @@ function makeLocalCommandHarness(input: {
               ),
             }),
           getTurnStartHistory: () =>
-            Effect.fail(
-              new ProjectionStore.ProjectionStoreReadError({
-                threadId,
-                cause: input.historyReadFailureAfterFallback,
-              }),
-            ),
+            input.deliverProviderTurn === true
+              ? Effect.succeed([])
+              : Effect.fail(
+                  new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: input.historyReadFailureAfterFallback,
+                  }),
+                ),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ open }),
         Layer.mock(ProviderAuthService.ProviderAuthService)({ tryHandlePromptCommand }),
@@ -565,6 +603,8 @@ function makeLocalCommandHarness(input: {
     },
     resolveRuntimePolicy,
     createWorktree,
+    prepareContinuation,
+    nativeStartTurn,
     open,
     writeIfRunCurrent,
     startRootRun,
@@ -1042,3 +1082,105 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect(
+  "persists continuation binding/history and delivers checkout context into a resumed native provider turn",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Implement the follow-up",
+        worktreePath: "/tmp/continuation-checkout",
+        previousNativeSession: true,
+        deliverProviderTurn: true,
+        continuation: {
+          branch: "feature/next",
+          notice: "PR #17 merged. Continuing on feature/next from origin/main.",
+          context:
+            "PR #17 merged. Old branch feature/restore; new branch feature/next; fetched base abc123. Earlier conversation describes the old checkout. Inspect current files.",
+          previousPullRequest: {
+            number: 17,
+            url: "https://github.com/owner/repo/pull/17",
+            title: "Prior PR",
+            repositoryKey: "github.com/owner/repo",
+            headBranch: "feature/restore",
+            baseBranch: "main",
+          },
+        },
+      });
+      const before = harness.projection();
+      harness.setProjection({
+        ...before,
+        providerThreads: before.providerThreads.map((thread) =>
+          thread.id === before.thread.activeProviderThreadId
+            ? {
+                ...thread,
+                nativeThreadRef: {
+                  driver: thread.driver,
+                  nativeId: "resumed-native-thread",
+                  strength: "strong",
+                },
+              }
+            : thread,
+        ),
+      });
+      yield* harness.start;
+      expect(harness.projection().thread.branch).toBe("feature/next");
+      expect(harness.projection().thread.branchPullRequest).toBeNull();
+      expect(harness.projection().thread.pullRequests).toMatchObject([
+        { number: 17, snapshot: { state: "merged" } },
+      ]);
+      expect(
+        harness
+          .projection()
+          .turnItems.some(
+            (item) =>
+              item.type === "system_notice" && item.message.includes("Continuing on feature/next"),
+          ),
+      ).toBe(true);
+      const input = harness.startRootRun.mock.calls[0]?.[0];
+      expect(input).toBeDefined();
+      if (input === undefined) return;
+      expect(input.appThread.branch).toBe("feature/next");
+      yield* input.session.startTurn({
+        ...input,
+        threadId: input.appThread.id,
+        runId: input.run.id,
+        runOrdinal: input.run.ordinal,
+        rootNodeId: input.rootNode.id,
+        restartContinuationOfRunId: RunId.make("prior-native-run"),
+      });
+      expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
+      const sent = harness.nativeStartTurn.mock.calls[0]?.[0];
+      expect(sent?.message.text).toContain("fetched base abc123");
+      expect(sent?.message.text).toContain("Implement the follow-up");
+      expect(sent?.restartContinuationOfRunId).toBeUndefined();
+    }),
+);
+
+effectIt.effect(
+  "leaves a failed preparation message retryable without opening or starting a provider",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Follow-up",
+        worktreePath: "/tmp/continuation-checkout",
+        continuationFailure: new GitManagerError({
+          operation: "prepareContinuation",
+          cwd: "/tmp/continuation-checkout",
+          detail: "Fetch failed. Retry preparation.",
+        }),
+      });
+      yield* harness.start;
+      expect(harness.open).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+      expect(harness.projection().messages.at(-1)?.text).toBe("Follow-up");
+      expect(
+        harness
+          .projection()
+          .turnItems.some(
+            (item) => item.type === "error" && item.failure.message.includes("Fetch failed"),
+          ),
+      ).toBe(true);
+    }),
+);

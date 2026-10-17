@@ -1,4 +1,9 @@
-import { AuthOrchestrationOperateScope, AuthSourceControlWriteScope } from "@t3tools/contracts";
+import {
+  AuthOrchestrationOperateScope,
+  AuthSourceControlWriteScope,
+  GitContinuationRequiredError,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -14,6 +19,9 @@ const state = vi.hoisted(() => ({
     branch: "main",
     worktreePath: null as string | null,
   },
+  gitError: null as unknown,
+  preparations: [] as { input: { message: { text: string }; dispatchMode: string } }[],
+  alerts: [] as { buttons: { text: string; onPress?: () => void }[] }[],
   commits: 0,
   pushes: 0,
   metadataRequests: [] as { environmentId: string; branch: string }[],
@@ -22,6 +30,11 @@ const state = vi.hoisted(() => ({
   statusRefreshes: 0,
 }));
 
+vi.mock("../components/ui/Dialog", () => ({
+  alert: (_title: string, _message: string, buttons: { text: string; onPress?: () => void }[]) => {
+    state.alerts.push({ buttons });
+  },
+}));
 vi.mock("react", () => ({
   useCallback: (callback: unknown) => callback,
   useMemo: (factory: () => unknown) => factory(),
@@ -59,6 +72,10 @@ vi.mock("./use-vcs-action-state", () => ({
 vi.mock("../lib/uuid", () => ({ uuidv4: () => "action" }));
 vi.mock("./threads", () => ({
   threadEnvironment: {
+    startTurn: async (input: { input: { message: { text: string }; dispatchMode: string } }) => {
+      state.preparations.push(input);
+      return AsyncResult.success(undefined);
+    },
     updateMetadata: async ({
       environmentId,
       input,
@@ -103,6 +120,7 @@ vi.mock("./vcs", () => ({
   vcsActionManager: {
     track: (_registry: unknown, _target: unknown, _operation: unknown, run: () => unknown) => run(),
     runStackedAction: () => async (input: { action: string; featureBranch?: boolean }) => {
+      if (state.gitError !== null) return AsyncResult.failure(Cause.fail(state.gitError));
       if (input.featureBranch) state.branch = "feature";
       if (input.action === "commit") state.commits += 1;
       if (input.action === "push") state.pushes += 1;
@@ -121,6 +139,9 @@ import { useSelectedThreadGitActions } from "./use-selected-thread-git-actions";
 
 describe("thread Git mutation permissions", () => {
   beforeEach(() => {
+    state.gitError = null;
+    state.preparations = [];
+    state.alerts = [];
     state.scopes = new Set([AuthSourceControlWriteScope]);
     state.primaryScopes = new Set([AuthSourceControlWriteScope, AuthOrchestrationOperateScope]);
     state.branch = "main";
@@ -278,5 +299,26 @@ describe("thread Git mutation permissions", () => {
     expect(state.branch).toBe("main");
     expect(state.thread.branch).toBe("main");
     expect(state.results).toEqual([]);
+  });
+  it("offers a preparation turn for a merged branch without committing, pushing, or opening a PR", async () => {
+    state.scopes.add(AuthOrchestrationOperateScope);
+    state.gitError = new GitContinuationRequiredError({
+      cwd: "/repo",
+      threadId: ThreadId.make("thread"),
+      branch: "feature/old",
+      pullRequestNumber: 17,
+      headSha: "abc123",
+    });
+    const actions = useSelectedThreadGitActions();
+    expect(await actions.onRunSelectedThreadGitAction({ action: "commit_push_pr" })).toBeNull();
+    expect(state.commits).toBe(0);
+    expect(state.pushes).toBe(0);
+    state.alerts[0]?.buttons.find((button) => button.text === "Prepare continuation")?.onPress?.();
+    expect(state.preparations).toHaveLength(1);
+    expect(state.preparations[0]?.input.dispatchMode).toBe("queue");
+    expect(state.preparations[0]?.input.message.text).toContain(
+      "Do not commit, push, or create a PR",
+    );
+    expect(state.metadataRequests).toEqual([]);
   });
 });

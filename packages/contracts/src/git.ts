@@ -126,6 +126,13 @@ export const GitRunStackedActionInput = Schema.Struct({
   action: GitStackedAction,
   commitMessage: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(10_000))),
   featureBranch: Schema.optional(Schema.Boolean),
+  reuseMergedBranch: Schema.optional(
+    Schema.Struct({
+      branch: TrimmedNonEmptyStringSchema,
+      pullRequestNumber: PositiveInt,
+      headSha: TrimmedNonEmptyStringSchema,
+    }),
+  ),
   filePaths: Schema.optional(Schema.Array(GitFilePath).check(Schema.isMinLength(1))),
   threadId: Schema.optional(ThreadId),
   projectId: Schema.optional(ProjectId),
@@ -402,6 +409,21 @@ export class GitManagerError extends Schema.TaggedError<GitManagerError>()("GitM
   }
 }
 
+export class GitContinuationRequiredError extends Schema.TaggedError<GitContinuationRequiredError>()(
+  "GitContinuationRequiredError",
+  {
+    cwd: Schema.String,
+    threadId: ThreadId,
+    branch: Schema.String,
+    pullRequestNumber: PositiveInt,
+    headSha: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `PR #${this.pullRequestNumber} merged. Prepare continuation before committing or creating another PR, or explicitly reuse this merged branch for this action.`;
+  }
+}
+
 export class GitPullRequestMaterializationError extends Schema.TaggedError<GitPullRequestMaterializationError>()(
   "GitPullRequestMaterializationError",
   {
@@ -419,6 +441,7 @@ export class GitPullRequestMaterializationError extends Schema.TaggedError<GitPu
 }
 
 export const GitManagerServiceError = Schema.Union([
+  GitContinuationRequiredError,
   GitManagerError,
   GitPullRequestMaterializationError,
   GitCommandError,

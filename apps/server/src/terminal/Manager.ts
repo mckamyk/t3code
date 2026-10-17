@@ -178,6 +178,8 @@ export class TerminalManager extends Context.Service<
       readonly terminalId?: string;
     }) => Effect.Effect<void>;
 
+    readonly hasWorkspaceSessions: (cwd: string) => Effect.Effect<boolean>;
+
     readonly subscribe: (
       listener: (event: TerminalEvent) => Effect.Effect<void>,
     ) => Effect.Effect<() => void>;
@@ -3111,6 +3113,31 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       ),
     );
 
+  const hasWorkspaceSessions = Effect.fn("TerminalManager.hasWorkspaceSessions")(function* (
+    cwd: string,
+  ) {
+    const canonical = (directory: string) =>
+      fileSystem.realPath(directory).pipe(Effect.orElseSucceed(() => path.resolve(directory)));
+    const root = yield* canonical(cwd);
+    const state = yield* readManagerState;
+    for (const session of state.sessions.values()) {
+      if (session.status !== "starting" && session.status !== "running") continue;
+      for (const directory of [
+        session.cwd,
+        ...(session.worktreePath === null ? [] : [session.worktreePath]),
+      ]) {
+        const target = yield* canonical(directory);
+        const relative = path.relative(root, target);
+        if (
+          relative === "" ||
+          (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+        )
+          return true;
+      }
+    }
+    return false;
+  });
+
   return TerminalManager.of({
     open,
     attachStream,
@@ -3121,6 +3148,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     restart,
     close,
     closeIdle,
+    hasWorkspaceSessions,
     subscribe,
     subscribeMetadata,
   });

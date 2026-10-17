@@ -1,3 +1,8 @@
+import {
+  isContinuationRequired,
+  continuationPreparationInput,
+} from "@t3tools/client-runtime/state/vcs";
+import type { GitContinuationRequiredError, GitRunStackedActionInput } from "@t3tools/contracts";
 import { ThreadDetailsControl } from "./chat/ThreadDetailsControl";
 import { useAtomValue } from "@effect/atom-react";
 import {
@@ -150,6 +155,7 @@ interface RunGitActionWithToastInput {
   statusOverride?: VcsStatusResult | null;
   featureBranch?: boolean;
   filePaths?: string[];
+  reuseMergedBranch?: GitRunStackedActionInput["reuseMergedBranch"];
 }
 
 interface InlineGitActionSuccess {
@@ -997,6 +1003,12 @@ export default function GitActionsControl({
     threadEnvironment.updateMetadata,
     "thread branch metadata update",
   );
+  const startPreparationTurn = useAtomCommand(threadEnvironment.startTurn, "prepare continuation");
+  const [pendingContinuation, setPendingContinuation] = useState<{
+    environmentId: ScopedThreadRef["environmentId"];
+    error: GitContinuationRequiredError;
+    input: RunGitActionWithToastInput;
+  } | null>(null);
   const activeEnvironmentId = activeThreadRef?.environmentId ?? null;
   const successScopeKey = `${activeEnvironmentId ?? ""}\u0000${gitCwd ?? ""}`;
   const canWriteSourceControl = useEnvironmentScope(
@@ -1248,6 +1260,7 @@ export default function GitActionsControl({
       statusOverride,
       featureBranch = false,
       filePaths,
+      reuseMergedBranch,
     }: RunGitActionWithToastInput) {
       if (
         activeEnvironmentId === null ||
@@ -1300,6 +1313,7 @@ export default function GitActionsControl({
         ...(commitMessage ? { commitMessage } : {}),
         ...(featureBranch ? { featureBranch } : {}),
         ...(filePaths ? { filePaths } : {}),
+        ...(reuseMergedBranch ? { reuseMergedBranch } : {}),
         ...(activeServerThread ? { threadId: activeServerThread.id } : {}),
         ...(activeDraftThread ? { projectId: activeDraftThread.projectId } : {}),
       });
@@ -1310,6 +1324,19 @@ export default function GitActionsControl({
         }
 
         const error = squashAtomCommandFailure(result);
+        if (isContinuationRequired(error)) {
+          setPendingContinuation({
+            environmentId: activeEnvironmentId,
+            error,
+            input: {
+              action,
+              ...(commitMessage ? { commitMessage } : {}),
+              featureBranch,
+              ...(filePaths ? { filePaths } : {}),
+            },
+          });
+          return;
+        }
         const errorToastTiming = resolveGitActionResultToastTiming("error");
         toastManager.add(
           stackedThreadToast({
@@ -2079,6 +2106,78 @@ export default function GitActionsControl({
               onClick={runDialogAction}
             >
               Commit
+            </Button>
+          </DialogFooter>
+        </DialogPopup>
+      </Dialog>
+
+      <Dialog
+        open={
+          pendingContinuation !== null && pendingContinuation.environmentId === activeEnvironmentId
+        }
+        onOpenChange={(open) => {
+          if (!open) setPendingContinuation(null);
+        }}
+      >
+        <DialogPopup>
+          <DialogHeader>
+            <DialogTitle>Prepare continuation</DialogTitle>
+            <DialogDescription>
+              PR #{pendingContinuation?.error.pullRequestNumber} merged. Prepare a fresh branch
+              before continuing. Existing work will be preserved. Preparation does not commit, push,
+              or open a PR.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPendingContinuation(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="outline"
+              disabled={
+                !canWriteSourceControl ||
+                pendingContinuation?.environmentId !== activeEnvironmentId ||
+                pendingContinuation?.error.cwd !== gitCwd
+              }
+              onClick={() => {
+                const pending = pendingContinuation;
+                if (
+                  pending === null ||
+                  pending.environmentId !== activeEnvironmentId ||
+                  pending.error.cwd !== gitCwd
+                )
+                  return;
+                setPendingContinuation(null);
+                void runGitActionWithToast({
+                  ...pending.input,
+                  reuseMergedBranch: {
+                    branch: pending.error.branch,
+                    pullRequestNumber: pending.error.pullRequestNumber,
+                    headSha: pending.error.headSha,
+                  },
+                });
+              }}
+            >
+              Reuse merged branch once
+            </Button>
+            <Button
+              disabled={
+                !canChangeThreadBranch ||
+                activeServerThread === null ||
+                pendingContinuation?.error.threadId !== activeServerThread?.id
+              }
+              onClick={() => {
+                if (activeServerThread === null || activeEnvironmentId === null) return;
+                setPendingContinuation(null);
+                void startPreparationTurn(
+                  continuationPreparationInput(
+                    { ...activeServerThread, environmentId: activeEnvironmentId },
+                    randomUUID(),
+                  ),
+                );
+              }}
+            >
+              Prepare continuation
             </Button>
           </DialogFooter>
         </DialogPopup>

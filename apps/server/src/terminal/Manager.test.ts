@@ -463,6 +463,25 @@ it.layer(
     }),
   );
 
+  it.effect(
+    "protects a workspace while it has an open terminal, including a shell in a subdirectory",
+    () =>
+      Effect.gen(function* () {
+        const { manager, baseDir } = yield* createManager();
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const workspace = path.join(baseDir, "checkout");
+        const subdirectory = path.join(workspace, "src");
+        yield* fs.makeDirectory(subdirectory, { recursive: true });
+        expect(yield* manager.hasWorkspaceSessions(workspace)).toBe(false);
+        yield* manager.open(openInput({ cwd: subdirectory, worktreePath: null }));
+        expect(yield* manager.hasWorkspaceSessions(workspace)).toBe(true);
+        expect(yield* manager.hasWorkspaceSessions(path.join(baseDir, "other"))).toBe(false);
+        yield* manager.close({ threadId: "thread-1" });
+        expect(yield* manager.hasWorkspaceSessions(workspace)).toBe(false);
+      }),
+  );
+
   it.effect("keeps attach streams live when a terminal id is closed and reopened", () =>
     Effect.gen(function* () {
       const { manager, ptyAdapter } = yield* createManager();

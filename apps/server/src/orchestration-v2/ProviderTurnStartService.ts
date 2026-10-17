@@ -2,6 +2,7 @@ import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
   CommandId,
+  GitManagerError,
   latestProviderTurnForAttempt,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ExecutionNode,
@@ -23,6 +24,7 @@ import * as Path from "effect/Path";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 
+import { threadPullRequestsOf } from "@t3tools/shared/threadPullRequests";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -480,6 +482,200 @@ export const layer: Layer.Layer<
           }
         }
       }
+      let continuationThread = projection.thread;
+      const continuationNoticeId = idAllocator.derive.runSignalTurnItem({
+        runId,
+        signal: "post-merge-continuation",
+      });
+      const continuationNotice = (message: string, now: DateTime.Utc): OrchestrationV2TurnItem => ({
+        id: continuationNoticeId,
+        threadId: projection.thread.id,
+        runId,
+        nodeId: rootNode.id,
+        providerThreadId: providerThread.id,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal:
+          Math.max(
+            0,
+            ...projection.turnItems
+              .filter((item) => item.runId === runId)
+              .map((item) => item.ordinal),
+          ) + 1,
+        type: "system_notice",
+        title: "Post-merge continuation",
+        message,
+        status: "completed",
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+      });
+      const continuation = yield* Effect.result(
+        gitWorkflow.prepareThreadContinuation(
+          { threadId: projection.thread.id, requestId: run.id },
+          {
+            onPreparing: (number) =>
+              Effect.gen(function* () {
+                const now = yield* DateTime.now;
+                const written = yield* eventSink.writeIfRunCurrent({
+                  threadId: projection.thread.id,
+                  runId,
+                  activeAttemptId: attempt.id,
+                  expectedStatus: "starting",
+                  events: [
+                    {
+                      id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                      type: "turn-item.updated",
+                      threadId: projection.thread.id,
+                      runId,
+                      occurredAt: now,
+                      payload: continuationNotice(
+                        `PR #${number} merged. Preparing continuation…`,
+                        now,
+                      ),
+                    },
+                  ],
+                });
+                if (!written.committed)
+                  return yield* new GitManagerError({
+                    operation: "prepareContinuation",
+                    cwd: worktreePath ?? "",
+                    detail: "The turn changed before continuation preparation.",
+                  });
+              }).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new GitManagerError({
+                      operation: "prepareContinuation",
+                      cwd: worktreePath ?? "",
+                      detail: "Could not persist continuation preparation status.",
+                      cause,
+                    }),
+                ),
+              ),
+          },
+        ),
+      );
+      if (continuation._tag === "Failure") {
+        if (input.willRetry === true) return yield* continuation.failure;
+        yield* settleRunBeforeStart({
+          signal: "continuation-preparation-failed",
+          status: "failed",
+          now: yield* DateTime.now,
+          providerInstanceId: run.providerInstanceId,
+          itemProviderThreadId: providerThread.id,
+          item: {
+            type: "error",
+            title: "Continuation preparation failed. Retry this message after resolving the error.",
+            failure: makeProviderFailure({
+              cause: continuation.failure,
+              message: continuation.failure.message,
+              class: "validation_error",
+            }),
+          },
+        });
+        return;
+      }
+      const continuationContext = continuation.success.context ?? "";
+      if (continuation.success.notice !== undefined) {
+        const now = yield* DateTime.now;
+        const currentThread = yield* projectionStore.getThread(projection.thread.id);
+        const nextBranch = continuation.success.branch;
+        if (
+          nextBranch !== undefined &&
+          (currentThread.worktreePath !== worktreePath ||
+            (currentThread.branch !== projection.thread.branch &&
+              currentThread.branch !== nextBranch))
+        ) {
+          yield* settleRunBeforeStart({
+            signal: "continuation-binding-changed",
+            status: "failed",
+            now,
+            providerInstanceId: run.providerInstanceId,
+            itemProviderThreadId: providerThread.id,
+            item: {
+              type: "error",
+              title: "Continuation binding changed",
+              failure: makeProviderFailure({
+                class: "validation_error",
+                message:
+                  "The thread branch binding changed during preparation. Inspect the checkout and retry this message.",
+              }),
+            },
+          });
+          return;
+        }
+        const events: Array<OrchestrationV2DomainEvent> = [];
+        const previousPr = continuation.success.previousPullRequest;
+        const previousLink =
+          previousPr === undefined
+            ? undefined
+            : threadPullRequestsOf(currentThread).find((link) => link.url === previousPr.url);
+        let pullRequests = currentThread.pullRequests;
+        if (previousPr !== undefined) {
+          const [host = "", ...repository] = previousPr.repositoryKey.split("/");
+          pullRequests = [
+            ...threadPullRequestsOf(currentThread).filter((link) => link !== previousLink),
+            {
+              ...previousLink,
+              host,
+              repository: repository.join("/"),
+              number: previousPr.number,
+              url: previousPr.url,
+              source: previousLink?.source ?? "agent",
+              linkedAt: previousLink?.linkedAt ?? DateTime.formatIso(now),
+              stack: previousLink?.stack ?? null,
+              snapshot: {
+                ...previousLink?.snapshot,
+                state: "merged",
+                title: previousPr.title,
+                headBranch: previousPr.headBranch,
+                baseBranch: previousPr.baseBranch,
+                isDraft: false,
+                updatedAt: null,
+                syncedAt: DateTime.formatIso(now),
+              },
+            },
+          ];
+        }
+        continuationThread = {
+          ...currentThread,
+          ...(nextBranch === undefined ? {} : { branch: nextBranch, branchPullRequest: null }),
+          ...(pullRequests === undefined ? {} : { pullRequests }),
+          updatedAt: now,
+        };
+        if (
+          (nextBranch !== undefined && currentThread.branch !== nextBranch) ||
+          pullRequests !== currentThread.pullRequests
+        ) {
+          events.push({
+            id: yield* idAllocator.allocate.event({ threadId: currentThread.id }),
+            type: "thread.metadata-updated",
+            threadId: currentThread.id,
+            occurredAt: now,
+            payload: continuationThread,
+          });
+        }
+        events.push({
+          id: yield* idAllocator.allocate.event({ threadId: currentThread.id }),
+          type: "turn-item.updated",
+          threadId: currentThread.id,
+          runId,
+          occurredAt: now,
+          payload: continuationNotice(continuation.success.notice, now),
+        });
+        if (events.length > 0) {
+          const written = yield* eventSink.writeIfRunCurrent({
+            threadId: currentThread.id,
+            runId,
+            activeAttemptId: attempt.id,
+            expectedStatus: "starting",
+            events,
+          });
+          if (!written.committed) return;
+        }
+      }
       const selectInheritedBackgroundItems = (
         current: ProjectionStore.ProjectionRuntimeRecoveryState,
       ): ReturnType<typeof RunExecutionService.selectInheritedBackgroundTurnItems> =>
@@ -505,7 +701,7 @@ export const layer: Layer.Layer<
       const { isCurrentAttemptInStatus } = runControls;
 
       const resolvedRuntimePolicy = yield* runtimePolicy.resolve({
-        thread: projection.thread,
+        thread: continuationThread,
         modelSelection: run.modelSelection,
       });
       const existingSessionProjection = projection.providerSessions.find(
@@ -1138,12 +1334,12 @@ export const layer: Layer.Layer<
           });
           if (!(yield* isCurrentAttemptInStatus("running"))) return;
           const start = compact ? session.compactThread! : session.startTurn;
-          const context = [delivery.context, restartNote]
+          const context = [delivery.context, restartNote, continuationContext]
             .filter((part) => part !== "")
             .join("\n\n");
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
           yield* start({
-            ...(noteContinuation ? promptedInput : turnInput),
+            ...(noteContinuation || continuationContext !== "" ? promptedInput : turnInput),
             message: {
               ...turnInput.message,
               text: context === "" ? userText : `${context}\n\nUser message:\n${userText}`,
@@ -1190,12 +1386,13 @@ export const layer: Layer.Layer<
         effectiveHandoffs.length === 0 &&
         missedItems.length === 0 &&
         restartNote === "" &&
+        continuationContext === "" &&
         !noteContinuation
           ? session
           : makeDeliverySession(session, startWithHandoffs);
       return runExecution.startRootRun({
         commandId: CommandId.make(`command:effect:provider-turn.start:${run.id}`),
-        appThread: projection.thread,
+        appThread: continuationThread,
         providerSessionId,
         session: deliverySession,
         run: runningRun,

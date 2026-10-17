@@ -147,6 +147,20 @@ the intended remote with `git branch --set-upstream-to=<remote>/<branch>`.
 Choose the writing style and model in **Settings → Source Control**. **Repository conventions**
 uses the project's instructions and recent commit subjects.
 
+## Continue after a merge
+
+Send your next message in the same thread. For an exclusive T3-managed worktree whose PR merged
+into the repository's default branch, T3 Code fetches that branch before the agent starts. A clean
+checkout moves to a fresh branch in the same folder; the old branch and PR remain available.
+If you already have follow-up changes or commits, the agent prepares those changes first while
+preserving your work. Fetch failures stop the turn so you can fix the connection and retry.
+
+If a Git action asks you to **Prepare continuation**, use that action to start a preparation turn,
+then review the result before committing. Preparation does not commit, push, or open a PR.
+**Reuse merged branch once** explicitly runs only the requested Git action on the old history.
+Shared or busy worktrees, stacks, forks, and PRs targeting other branches require explicit
+preparation in an exclusive checkout.
+
 ## Review and merge
 
 Open **Pull requests** to review changes and comments, request reviewers, check out a branch,

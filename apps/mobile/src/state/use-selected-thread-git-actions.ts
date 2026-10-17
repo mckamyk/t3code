@@ -1,3 +1,9 @@
+import {
+  isContinuationRequired,
+  continuationPreparationInput,
+} from "@t3tools/client-runtime/state/vcs";
+import type { GitContinuationRequiredError } from "@t3tools/contracts";
+import * as Dialog from "../components/ui/Dialog";
 import { useCallback, useEffect, useEffectEvent, useMemo } from "react";
 
 import { EnvironmentProject, EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
@@ -36,6 +42,7 @@ export function useSelectedThreadGitActions() {
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
+  const startPreparationTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: true });
   const refreshStatus = useAtomCommand(vcsEnvironment.refreshStatus, { reportFailure: false });
   const switchRef = useAtomCommand(vcsEnvironment.switchRef, { reportFailure: false });
   const createRef = useAtomCommand(vcsEnvironment.createRef, { reportFailure: false });
@@ -178,7 +185,11 @@ export function useSelectedThreadGitActions() {
         readonly project: EnvironmentProject;
         readonly cwd: string;
       }) => Promise<AtomCommandResult<T, E>>,
-      options?: { readonly managedExternally?: boolean; readonly changesThreadBranch?: boolean },
+      options?: {
+        readonly managedExternally?: boolean;
+        readonly changesThreadBranch?: boolean;
+        readonly retryMergedBranch?: (error: GitContinuationRequiredError) => void;
+      },
     ): Promise<T | null> => {
       if (
         !selectedThread ||
@@ -208,6 +219,36 @@ export function useSelectedThreadGitActions() {
           : await vcsActionManager.track(appAtomRegistry, target, { operation, label }, run);
       if (AsyncResult.isFailure(result)) {
         const error = Cause.squash(result.cause);
+        if (isContinuationRequired(error)) {
+          Dialog.alert(
+            "Prepare continuation",
+            `PR #${error.pullRequestNumber} merged. Preparation preserves existing work and does not commit, push or open a PR.`,
+            [
+              { text: "Cancel", style: "cancel" },
+              ...(options?.retryMergedBranch
+                ? [
+                    {
+                      text: "Reuse merged branch once",
+                      onPress: () => options.retryMergedBranch?.(error),
+                    },
+                  ]
+                : []),
+              ...(canChangeThreadBranch
+                ? [
+                    {
+                      text: "Prepare continuation",
+                      onPress: () => {
+                        void startPreparationTurn(
+                          continuationPreparationInput(selectedThread, uuidv4()),
+                        );
+                      },
+                    },
+                  ]
+                : []),
+            ],
+          );
+          return null;
+        }
         const message = error instanceof Error ? error.message : "Git action failed.";
         setPendingConnectionError(message);
         showGitActionResult({ type: "error", title: "Git action failed", description: message });
@@ -215,7 +256,13 @@ export function useSelectedThreadGitActions() {
       }
       return result.value;
     },
-    [selectedThread, selectedThreadCwd, selectedThreadProject],
+    [
+      selectedThread,
+      selectedThreadCwd,
+      selectedThreadProject,
+      canChangeThreadBranch,
+      startPreparationTurn,
+    ],
   );
 
   const refreshSelectedThreadBranches = useCallback(async (): Promise<ReadonlyArray<VcsRef>> => {
@@ -377,7 +424,9 @@ export function useSelectedThreadGitActions() {
   }, [pull, refreshSelectedThreadGitStatus, runSelectedThreadGitMutation]);
 
   const onRunSelectedThreadGitAction = useCallback(
-    async (input: GitActionRequestInput): Promise<GitRunStackedActionResult | null> => {
+    async function runAction(
+      input: GitActionRequestInput,
+    ): Promise<GitRunStackedActionResult | null> {
       const actionId = uuidv4();
       return await runSelectedThreadGitMutation(
         "run_change_request",
@@ -389,6 +438,7 @@ export function useSelectedThreadGitActions() {
             ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
             ...(input.featureBranch ? { featureBranch: input.featureBranch } : {}),
             ...(input.filePaths?.length ? { filePaths: [...input.filePaths] } : {}),
+            ...(input.reuseMergedBranch ? { reuseMergedBranch: input.reuseMergedBranch } : {}),
             threadId: thread.id,
           });
           if (AsyncResult.isFailure(result)) {
@@ -419,7 +469,20 @@ export function useSelectedThreadGitActions() {
           });
           return result;
         },
-        { managedExternally: true, changesThreadBranch: input.featureBranch === true },
+        {
+          managedExternally: true,
+          changesThreadBranch: input.featureBranch === true,
+          retryMergedBranch: (error) => {
+            void runAction({
+              ...input,
+              reuseMergedBranch: {
+                branch: error.branch,
+                pullRequestNumber: error.pullRequestNumber,
+                headSha: error.headSha,
+              },
+            });
+          },
+        },
       );
     },
     [

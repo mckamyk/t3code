@@ -67,7 +67,21 @@ import {
   threadPullRequestKeyOf,
 } from "@t3tools/shared/threadPullRequests";
 
-import { GitManagerError, GitPullRequestMaterializationError } from "@t3tools/contracts";
+import {
+  GitManagerError,
+  GitPullRequestMaterializationError,
+  GitContinuationRequiredError,
+} from "@t3tools/contracts";
+import * as ServerConfig from "../config.ts";
+import * as TerminalManager from "../terminal/Manager.ts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
+import { managedWorktreesDirectories } from "../worktreesDirectory.ts";
+import {
+  ContinuationReceipt,
+  preparedContinuation,
+  type ThreadContinuationResult,
+} from "./continuationReceipt.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import {
   conventionalCommitsTextGenerationPolicy,
@@ -147,6 +161,18 @@ export class GitManager extends Context.Service<
     readonly preparePullRequestThread: (
       input: GitPreparePullRequestThreadInput,
     ) => Effect.Effect<GitPreparePullRequestThreadResult, GitManagerServiceError>;
+    /** Caller holds the workspace lease until binding and provider startup commit. */
+    readonly prepareThreadContinuation: (
+      input: {
+        readonly threadId: ThreadId;
+        readonly requestId: string;
+      },
+      options?: {
+        readonly onPreparing: (
+          pullRequestNumber: number,
+        ) => Effect.Effect<void, GitManagerServiceError>;
+      },
+    ) => Effect.Effect<ThreadContinuationResult, GitManagerServiceError>;
     readonly runStackedAction: (
       input: GitRunStackedActionInput,
       options?: GitRunStackedActionOptions,
@@ -158,6 +184,11 @@ export class GitManager extends Context.Service<
     >;
   }
 >()("t3/git/GitManager") {}
+
+const encodeContinuationReceipt = Schema.encodeEffect(Schema.fromJsonString(ContinuationReceipt));
+const decodeContinuationReceipt = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ContinuationReceipt),
+);
 
 const COMMIT_TIMEOUT_MS = 10 * 60_000;
 const MAX_PROGRESS_TEXT_LENGTH = 500;
@@ -696,6 +727,8 @@ function toPullRequestHeadRemoteInfo(pr: {
 
 export const make = Effect.gen(function* () {
   const gitCore = yield* GitVcsDriver.GitVcsDriver;
+  const serverConfig = yield* ServerConfig.ServerConfig;
+  const terminals = yield* TerminalManager.TerminalManager;
   const sourceControlProviders = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
   const textGeneration = yield* TextGeneration.TextGeneration;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
@@ -2846,6 +2879,489 @@ export const make = Effect.gen(function* () {
     }).pipe(Effect.ensuring(invalidateStatus(input.cwd)));
   });
 
+  const continuationError = (cwd: string, detail: string, cause?: unknown) =>
+    new GitManagerError({
+      operation: "prepareContinuation",
+      cwd,
+      detail,
+      ...(cause === undefined ? {} : { cause }),
+    });
+
+  const resolveManagedContinuationCheckout = Effect.fn("GitManager.continuationCheckout")(
+    function* (cwd: string) {
+      const settings = yield* serverSettingsService.getSettings.pipe(
+        Effect.mapError((cause) =>
+          continuationError(cwd, "Cannot read worktree storage settings.", cause),
+        ),
+      );
+      // Expanded paths are already accepted by the worktree creator. Resolve existing roots
+      // here as well so aliases cannot hide another owner of the checkout.
+      const roots = managedWorktreesDirectories(
+        settings,
+        serverConfig.worktreesDir,
+        path,
+        yield* HostProcess.HomeDirectory,
+      );
+      const topLevel = yield* gitCore.execute({
+        operation: "GitManager.continuationCheckout",
+        cwd,
+        args: ["rev-parse", "--show-toplevel"],
+      });
+      const gitPaths = yield* gitCore.execute({
+        operation: "GitManager.continuationWorktree",
+        cwd,
+        args: ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+      });
+      const [gitDir, commonDir] = gitPaths.stdout.trim().split("\n");
+      if (gitDir === commonDir) return null;
+      const canonicalCwd = yield* fileSystem
+        .realPath(topLevel.stdout.trim())
+        .pipe(
+          Effect.mapError((cause) =>
+            continuationError(cwd, "Cannot inspect the continuation checkout.", cause),
+          ),
+        );
+      let managed = false;
+      for (const root of roots) {
+        const canonicalRoot = yield* fileSystem
+          .realPath(root)
+          .pipe(Effect.orElseSucceed(() => root));
+        const relative = path.relative(canonicalRoot, canonicalCwd);
+        if (
+          relative !== "" &&
+          relative !== ".." &&
+          !relative.startsWith(`..${path.sep}`) &&
+          !path.isAbsolute(relative)
+        )
+          managed = true;
+      }
+      return managed ? canonicalCwd : null;
+    },
+  );
+
+  const managedContinuationOwners = Effect.fn("GitManager.continuationOwners")(function* (
+    cwd: string,
+  ) {
+    const canonicalCwd = yield* resolveManagedContinuationCheckout(cwd);
+    if (canonicalCwd === null) return [];
+    const owners = yield* threads
+      .getThreadWorktreePaths({ includeArchived: true })
+      .pipe(
+        Effect.mapError((cause) =>
+          continuationError(cwd, "Cannot verify worktree ownership.", cause),
+        ),
+      );
+    return yield* Effect.filter(owners, (owner) =>
+      fileSystem.realPath(owner.worktreePath).pipe(
+        Effect.map((ownerPath) => ownerPath === canonicalCwd),
+        Effect.orElseSucceed(() => path.resolve(owner.worktreePath) === canonicalCwd),
+      ),
+    );
+  });
+
+  const continuationGit = (cwd: string, args: readonly string[]) =>
+    gitCore
+      .execute({
+        operation: "GitManager.prepareContinuation",
+        cwd,
+        args,
+      })
+      .pipe(Effect.map((result) => result.stdout.trim()));
+
+  const saveContinuationReceipt = Effect.fn("GitManager.saveContinuationReceipt")(function* (
+    cwd: string,
+    receiptPath: string,
+    receipt: ContinuationReceipt,
+  ) {
+    const text = yield* encodeContinuationReceipt(receipt).pipe(
+      Effect.mapError((cause) =>
+        continuationError(cwd, "Cannot encode continuation receipt.", cause),
+      ),
+    );
+    yield* fileSystem.writeFileString(`${receiptPath}.tmp`, text).pipe(
+      Effect.andThen(fileSystem.rename(`${receiptPath}.tmp`, receiptPath)),
+      Effect.mapError((cause) =>
+        continuationError(cwd, "Cannot save continuation receipt.", cause),
+      ),
+    );
+  });
+
+  const prepareThreadContinuation: GitManager["Service"]["prepareThreadContinuation"] = Effect.fn(
+    "GitManager.prepareThreadContinuation",
+  )(function* (input, options) {
+    const thread = yield* threads
+      .getThread(input.threadId)
+      .pipe(
+        Effect.mapError((cause) =>
+          continuationError("", "Cannot read the continuation thread.", cause),
+        ),
+      );
+    const cwd = thread.worktreePath;
+    if (cwd === null) return {};
+    if ((yield* resolveManagedContinuationCheckout(cwd)) === null) return {};
+    const readCheckout = Effect.gen(function* () {
+      const branch = yield* continuationGit(cwd, [
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+      ]).pipe(Effect.orElseSucceed(() => null));
+      const head = yield* continuationGit(cwd, ["rev-parse", "HEAD"]);
+      const status = yield* continuationGit(cwd, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+      return { branch, head, status };
+    });
+    const checkout = yield* readCheckout;
+    const commonGitDirectory = yield* continuationGit(cwd, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]);
+    // Cleanup can delete a worktree's administrative directory before a failed
+    // provider turn is retried. Keep its undelivered context with the repository.
+    const receiptDigest = yield* crypto
+      .digest("SHA-256", new TextEncoder().encode(thread.id))
+      .pipe(
+        Effect.mapError((cause) =>
+          continuationError(cwd, "Cannot identify the continuation receipt.", cause),
+        ),
+      );
+    const receiptKey = Array.from(receiptDigest, (byte) => byte.toString(16).padStart(2, "0")).join(
+      "",
+    );
+    const receiptPath = path.join(commonGitDirectory, `t3-continuation-${receiptKey}.json`);
+    const receiptExists = yield* fileSystem
+      .exists(receiptPath)
+      .pipe(
+        Effect.mapError((cause) =>
+          continuationError(cwd, "Cannot read continuation receipt.", cause),
+        ),
+      );
+    const receipt = receiptExists
+      ? yield* fileSystem.readFileString(receiptPath).pipe(
+          Effect.flatMap(decodeContinuationReceipt),
+          Effect.mapError((cause) =>
+            continuationError(
+              cwd,
+              "Cannot read continuation receipt. Inspect this checkout before retrying.",
+              cause,
+            ),
+          ),
+        )
+      : undefined;
+    const ensureExclusive = Effect.fn("GitManager.continuationExclusive")(function* (
+      pullRequestNumber: number,
+    ) {
+      const currentOwners = yield* managedContinuationOwners(cwd);
+      const fail = (message: string) =>
+        continuationError(cwd, `PR #${pullRequestNumber} merged. ${message}`);
+      if (currentOwners.length !== 1 || currentOwners[0]?.threadId !== thread.id)
+        return yield* fail(
+          "This worktree is shared by other threads. Stop their work and use an exclusive checkout before preparing continuation. The checkout was preserved.",
+        );
+      if (yield* terminals.hasWorkspaceSessions(cwd))
+        return yield* fail(
+          "An open terminal owns this checkout. Close its terminal sessions before preparing continuation. The checkout was preserved.",
+        );
+      const bound = yield* threads
+        .getThread(thread.id)
+        .pipe(
+          Effect.mapError((cause) =>
+            continuationError(cwd, "Cannot verify the thread branch binding.", cause),
+          ),
+        );
+      if (bound.branch !== thread.branch || bound.worktreePath !== cwd)
+        return yield* fail(
+          "The thread branch binding changed during preparation. Retry after other work stops.",
+        );
+      const runtime = yield* threads
+        .getRuntimeRecoveryProjection(thread.id)
+        .pipe(
+          Effect.mapError((cause) =>
+            continuationError(cwd, "Cannot verify active work before continuation.", cause),
+          ),
+        );
+      if (
+        runtime.runs.some(
+          (run) =>
+            run.id !== input.requestId &&
+            ["preparing", "starting", "running", "waiting"].includes(run.status),
+        ) ||
+        runtime.turnItems.some((item) => ["pending", "running", "waiting"].includes(item.status)) ||
+        runtime.subagents.some((agent) => ["pending", "running", "waiting"].includes(agent.status))
+      ) {
+        return yield* fail(
+          "Background work or another active session owns this checkout. Stop that work before preparing continuation. The checkout was preserved.",
+        );
+      }
+    });
+    if (
+      receipt?.threadId === thread.id &&
+      checkout.branch === receipt.branch &&
+      thread.branch !== receipt.oldBranch &&
+      thread.branch !== receipt.branch
+    )
+      return yield* continuationError(
+        cwd,
+        "The thread binding differs from both continuation branches. Inspect the checkout and explicitly update its branch binding before retrying.",
+      );
+    // Recover a switch whose thread event was not committed. A completed receipt only
+    // supplies context for its original run, never triggers another transition.
+    if (
+      receipt?.threadId === input.threadId &&
+      checkout.branch === receipt.branch &&
+      (thread.branch === receipt.oldBranch || receipt.requestId === input.requestId)
+    ) {
+      yield* ensureExclusive(receipt.pullRequestNumber);
+      if (thread.branch === receipt.oldBranch && checkout.head !== receipt.baseSha)
+        return yield* continuationError(
+          cwd,
+          "The continuation branch changed before its binding was saved. Inspect the checkout before retrying.",
+        );
+      return preparedContinuation(receipt);
+    }
+    let pendingContext: string | undefined;
+    if (
+      receipt?.threadId === thread.id &&
+      checkout.branch === receipt.branch &&
+      !receipt.contextDelivered
+    ) {
+      const runtime = yield* threads
+        .getRuntimeRecoveryProjection(thread.id)
+        .pipe(
+          Effect.mapError((cause) =>
+            continuationError(cwd, "Cannot verify delivery of continuation context.", cause),
+          ),
+        );
+      const source = runtime.runs.find((run) => run.id === receipt.requestId);
+      const compactionMessages = new Set(
+        runtime.messages
+          .filter(
+            (message) =>
+              message.attachments.length === 0 && message.text.trim().toLowerCase() === "/compact",
+          )
+          .map((message) => message.id),
+      );
+      const deliveredRunIds = new Set(
+        runtime.runs
+          .filter(
+            (run) =>
+              source !== undefined &&
+              run.ordinal >= source.ordinal &&
+              !compactionMessages.has(run.userMessageId),
+          )
+          .map((run) => run.id),
+      );
+      const deliveredAttemptIds = new Set(
+        runtime.attempts
+          .filter((attempt) => deliveredRunIds.has(attempt.runId))
+          .map((attempt) => attempt.id),
+      );
+      if (
+        !runtime.providerTurns.some(
+          (turn) => turn.runAttemptId !== null && deliveredAttemptIds.has(turn.runAttemptId),
+        )
+      ) {
+        yield* ensureExclusive(receipt.pullRequestNumber);
+        pendingContext = preparedContinuation(receipt).context;
+      } else
+        yield* saveContinuationReceipt(cwd, receiptPath, { ...receipt, contextDelivered: true });
+    }
+    if (checkout.branch === null) {
+      if (thread.branch === null) return {};
+      return yield* continuationError(
+        cwd,
+        "This worktree has detached HEAD instead of its bound branch. Explicitly select the intended branch before preparing continuation. The checkout was preserved.",
+      );
+    }
+    const linked = yield* branchPullRequest({ cwd, branch: checkout.branch }, { refresh: true });
+    if (linked?.state !== "merged")
+      return pendingContext === undefined ? {} : { context: pendingContext };
+    const blocked = (detail: string) =>
+      continuationError(cwd, `PR #${linked.number} merged. ${detail}`);
+    yield* ensureExclusive(linked.number);
+    if (checkout.branch !== thread.branch)
+      return yield* blocked(
+        "The checkout branch differs from the thread's saved branch. Explicit preparation is required before implementation. The checkout was preserved.",
+      );
+    if (options !== undefined) yield* options.onPreparing(linked.number);
+    const provider = yield* sourceControlProvider(cwd);
+    const pr = yield* provider.getChangeRequest({ cwd, reference: linked.url });
+    const remoteHead = yield* continuationGit(cwd, ["ls-remote", "--symref", "origin", "HEAD"]);
+    const defaultBranch = /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(remoteHead)?.[1] ?? null;
+    const remoteUrl = yield* gitCore.readConfigValue(cwd, "remote.origin.url");
+    const repositoryKey = pullRequestRepositoryKey(pr.url);
+    const headRepository = pr.headRepositoryNameWithOwner;
+    const identityMatches =
+      repositoryKey !== null &&
+      remoteUrl !== null &&
+      canonicalRepositoryKey(repositoryKey) ===
+        canonicalRepositoryKey(normalizeGitRemoteUrl(remoteUrl));
+    if (
+      pr.state !== "merged" ||
+      pr.headRefName !== checkout.branch ||
+      !pr.headSha ||
+      pr.isCrossRepository !== false ||
+      !headRepository ||
+      !identityMatches ||
+      !(
+        repositoryKey !== null &&
+        canonicalRepositoryKey(repositoryKey).endsWith(`/${headRepository.toLowerCase()}`)
+      ) ||
+      defaultBranch === null ||
+      pr.baseRefName !== defaultBranch
+    ) {
+      return yield* blocked(
+        "This PR's head, repository or default-branch base cannot be verified. Explicit preparation is required for stacks, forks and other base branches. The checkout was preserved.",
+      );
+    }
+    // Fetch the host's current default branch even when ordinary new worktrees use local refs.
+    yield* continuationGit(cwd, [
+      "fetch",
+      "--no-tags",
+      "origin",
+      `+refs/heads/${defaultBranch}:refs/remotes/origin/${defaultBranch}`,
+    ]);
+    const baseSha = yield* continuationGit(cwd, [
+      "rev-parse",
+      `refs/remotes/origin/${defaultBranch}^{commit}`,
+    ]);
+    const currentPr = yield* branchPullRequest({ cwd, branch: checkout.branch }, { refresh: true });
+    if (currentPr?.state !== "merged" || currentPr.number !== pr.number || currentPr.url !== pr.url)
+      return yield* blocked(
+        "The branch's pull request changed during preparation. Retry this message; the checkout was preserved.",
+      );
+    const current = yield* readCheckout;
+    const currentOwners = yield* managedContinuationOwners(cwd);
+    if (
+      current.branch !== checkout.branch ||
+      current.head !== checkout.head ||
+      current.status !== checkout.status ||
+      (yield* gitCore.readConfigValue(cwd, "remote.origin.url")) !== remoteUrl ||
+      currentOwners.length !== 1 ||
+      currentOwners[0]?.threadId !== thread.id
+    ) {
+      return yield* blocked(
+        "The checkout or its ownership changed during preparation. Retry after other work stops.",
+      );
+    }
+    const previousPullRequest = {
+      number: pr.number,
+      url: pr.url,
+      title: pr.title,
+      repositoryKey: repositoryKey ?? "",
+      headBranch: pr.headRefName,
+      baseBranch: pr.baseRefName,
+    };
+    if (current.status !== "" || current.head !== pr.headSha) {
+      const boundary = yield* gitCore.execute({
+        operation: "GitManager.continuationBoundary",
+        cwd,
+        args: ["merge-base", "--is-ancestor", pr.headSha, current.head],
+        allowNonZeroExit: true,
+      });
+      return {
+        previousPullRequest,
+        notice: `PR #${pr.number} merged. Preserving existing work; continuation needs agent preparation.`,
+        context: `PREPARATION REQUIRED BEFORE IMPLEMENTATION: PR #${pr.number} (${pr.url}) merged from ${checkout.branch} at ${pr.headSha}. The checkout, commits, index, staged and untracked files were preserved. Fetched origin/${defaultBranch} at ${baseSha}. First inspect current files and existing follow-up work. Reconcile only follow-up changes onto a unique fresh branch based on that fetched SHA, in this same worktree, preserving ${checkout.branch}. ${boundary.exitCode === 0 ? `The exact merged head ${pr.headSha} is an ancestor of HEAD; it may be used as the boundary for follow-up commits after inspection.` : "History is ambiguous or rewritten. Inspect it; do not guess which commits to replay."} Never infer landed changes using git cherry or patch IDs. Preserve pending files and staging, resolve conflicts and test before addressing the queued user request. Do not commit, push or create a PR as part of preparation. Earlier conversation describes the old checkout; inspect the current files. Update the thread branch binding after switching.`,
+      };
+    }
+    const reusable =
+      receipt?.threadId === input.threadId &&
+      receipt.oldBranch === checkout.branch &&
+      receipt.mergedHeadSha === pr.headSha &&
+      receipt.pullRequestUrl === pr.url;
+    const next = reusable
+      ? receipt
+      : {
+          threadId: thread.id,
+          requestId: input.requestId,
+          oldBranch: checkout.branch,
+          branch: resolveAutoFeatureBranchName(
+            yield* gitCore.listLocalBranchNames(cwd),
+            `${checkout.branch}-continue-${pr.number}`,
+          ),
+          pullRequestNumber: pr.number,
+          pullRequestUrl: pr.url,
+          pullRequestTitle: pr.title,
+          repositoryKey: previousPullRequest.repositoryKey,
+          mergedHeadSha: pr.headSha,
+          baseBranch: defaultBranch,
+          baseSha,
+          contextDelivered: false,
+        };
+    if (next.baseSha !== baseSha)
+      return yield* blocked(
+        "The remote base advanced while preparation was interrupted. Inspect the saved continuation branch before retrying; no checkout changes were made.",
+      );
+    yield* saveContinuationReceipt(cwd, receiptPath, next);
+    const exists = yield* gitCore.execute({
+      operation: "GitManager.continuationBranch",
+      cwd,
+      args: ["show-ref", "--verify", "--quiet", `refs/heads/${next.branch}`],
+      allowNonZeroExit: true,
+    });
+    if (exists.exitCode !== 0) yield* continuationGit(cwd, ["branch", next.branch, next.baseSha]);
+    else if (
+      (yield* continuationGit(cwd, ["rev-parse", `refs/heads/${next.branch}`])) !== next.baseSha
+    ) {
+      return yield* blocked("The planned continuation branch changed. Inspect it before retrying.");
+    }
+    yield* continuationGit(cwd, ["config", `branch.${next.branch}.gh-merge-base`, next.baseBranch]);
+    yield* continuationGit(cwd, ["config", `branch.${next.branch}.remote`, "origin"]);
+    yield* continuationGit(cwd, [
+      "config",
+      `branch.${next.branch}.merge`,
+      `refs/heads/${next.baseBranch}`,
+    ]);
+    yield* ensureExclusive(pr.number);
+    const final = yield* readCheckout;
+    if (final.branch !== checkout.branch || final.head !== pr.headSha || final.status !== "") {
+      return yield* blocked(
+        "The checkout changed before switching. Existing work was preserved; retry preparation.",
+      );
+    }
+    yield* continuationGit(cwd, ["switch", next.branch]);
+    const switched = yield* readCheckout;
+    if (switched.branch !== next.branch || switched.head !== next.baseSha)
+      return yield* blocked(
+        "The checkout changed while switching branches. Inspect it before retrying preparation.",
+      );
+    yield* invalidateStatus(cwd);
+    return preparedContinuation(next);
+  });
+
+  const guardMergedBranch = Effect.fn("GitManager.guardMergedBranch")(function* (
+    input: GitRunStackedActionInput,
+    branch: string | null,
+  ) {
+    if (branch === null) return;
+    if ((yield* resolveManagedContinuationCheckout(input.cwd)) === null) return;
+    const pr = yield* branchPullRequest({ cwd: input.cwd, branch }, { refresh: true });
+    if (pr?.state !== "merged") return;
+    const owners = yield* managedContinuationOwners(input.cwd);
+    const owner = owners.find((candidate) => candidate.threadId === input.threadId) ?? owners[0];
+    if (owner === undefined) return;
+    const headSha = yield* continuationGit(input.cwd, ["rev-parse", "HEAD"]);
+    const reuse = input.reuseMergedBranch;
+    if (
+      reuse?.branch === branch &&
+      reuse.pullRequestNumber === pr.number &&
+      reuse.headSha === headSha
+    )
+      return;
+    return yield* new GitContinuationRequiredError({
+      cwd: input.cwd,
+      threadId: owner.threadId,
+      branch,
+      pullRequestNumber: pr.number,
+      headSha,
+    });
+  });
+
   const runFeatureBranchStep = Effect.fn("runFeatureBranchStep")(function* (
     settings: SourceControlTextGenerationSettings,
     cwd: string,
@@ -2893,6 +3409,7 @@ export const make = Effect.gen(function* () {
         GitManagerServiceError
       > {
         const initialStatus = yield* gitCore.statusDetails(input.cwd);
+        yield* guardMergedBranch(input, initialStatus.branch);
         const wantsCommit = isCommitAction(input.action);
         const wantsPush =
           input.action === "push" ||
@@ -3070,7 +3587,14 @@ export const make = Effect.gen(function* () {
         return result;
       });
 
-      return yield* runAction().pipe(
+      const leaseRoot = yield* gitCore.execute({
+        operation: "GitManager.actionCheckout",
+        cwd: input.cwd,
+        args: ["rev-parse", "--show-toplevel"],
+      });
+      const leaseOwners = yield* managedContinuationOwners(input.cwd);
+      const leasePath = path.resolve(leaseOwners[0]?.worktreePath ?? leaseRoot.stdout.trim());
+      return yield* withWorkspaceLease(leasePath, runAction()).pipe(
         Effect.ensuring(invalidateStatus(input.cwd)),
         Effect.tapError((error) =>
           Effect.flatMap(Ref.get(currentPhase), (phase) =>
@@ -3097,6 +3621,7 @@ export const make = Effect.gen(function* () {
     resolvePullRequest,
     preparePullRequestThread,
     runStackedAction,
+    prepareThreadContinuation,
     subscribePullRequestStateChanges: PubSub.subscribe(pullRequestStateChanges).pipe(
       Effect.map((subscription) => Stream.fromSubscription(subscription)),
     ),

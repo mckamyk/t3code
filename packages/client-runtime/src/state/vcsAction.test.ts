@@ -1,6 +1,7 @@
 import { vi } from "vite-plus/test";
 import {
   EnvironmentId,
+  GitContinuationRequiredError,
   AuthSourceControlWriteScope,
   ThreadId,
   ProjectId,
@@ -736,4 +737,25 @@ const grantedSessions = Atom.family((_id: EnvironmentId) =>
       scopes: [AuthSourceControlWriteScope],
     }),
   ),
+);
+
+it.effect("preserves structured continuation feedback when a Git action stream fails", () =>
+  Effect.gen(function* () {
+    const error = new GitContinuationRequiredError({
+      cwd,
+      threadId: ThreadId.make("thread"),
+      branch: "feature/old",
+      pullRequestNumber: 17,
+      headSha: "abc123",
+    });
+    const failed = yield* consumeVcsActionProgress(Stream.fail(error), {
+      target: { environmentId, cwd },
+      transportActionId: actionId,
+      actionId,
+      action,
+      onProgress: () => Effect.void,
+    }).pipe(Effect.flip);
+    expect(failed).toBe(error);
+    expect(failed).toMatchObject({ threadId: "thread" });
+  }),
 );

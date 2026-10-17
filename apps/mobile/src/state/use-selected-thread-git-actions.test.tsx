@@ -39,6 +39,7 @@ vi.mock("./session", () => ({
   useEnvironmentScope: () => true,
 }));
 vi.mock("./use-remote-environment-registry", () => ({ setPendingConnectionError: () => {} }));
+vi.mock("../components/ui/Dialog", () => ({ alert: vi.fn() }));
 vi.mock("./use-vcs-action-state", () => ({ showGitActionResult: () => {} }));
 vi.mock("./use-thread-selection", () => ({
   useThreadSelection: () => {

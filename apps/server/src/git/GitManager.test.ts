@@ -38,6 +38,7 @@ import {
   EventId,
   GitCommandError,
   ProjectId,
+  RunId,
   ProviderDriverKind,
   ProviderInstanceId,
   SourceControlProviderError as SourceControlProviderFailure,
@@ -74,6 +75,8 @@ import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.t
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitManager from "./GitManager.ts";
+import * as TerminalManager from "../terminal/Manager.ts";
+import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 
 const encodeCliJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeForgejoPullRequest = Schema.decodeEffect(ForgejoPullRequestSchema);
@@ -723,6 +726,8 @@ function makeManager(input?: {
     readonly reached: Deferred.Deferred<void>;
     readonly release: Deferred.Deferred<void>;
   };
+  hasWorkspaceSessions?: TerminalManager.TerminalManager["Service"]["hasWorkspaceSessions"];
+  projectionStore?: Partial<ProjectionStore.ProjectionStoreV2["Service"]>;
   seed?: Effect.Effect<
     void,
     ProjectionStore.ProjectionStoreV2Error | ProjectStore.ProjectStoreV2Error,
@@ -819,6 +824,9 @@ function makeManager(input?: {
   );
 
   const layerManager = Layer.mergeAll(
+    Layer.mock(TerminalManager.TerminalManager)({
+      hasWorkspaceSessions: input?.hasWorkspaceSessions ?? (() => Effect.succeed(false)),
+    }),
     Layer.succeed(TextGeneration.TextGeneration, textGeneration),
     Layer.mock(ProviderRegistry.ProviderRegistry)({
       getProviders: Effect.succeed([]),
@@ -846,6 +854,10 @@ function makeManager(input?: {
     }
     const manager = yield* GitManager.make.pipe(
       Effect.provide(layerManager),
+      Effect.provideService(ProjectionStore.ProjectionStoreV2, {
+        ...Context.get(stores, ProjectionStore.ProjectionStoreV2),
+        ...input?.projectionStore,
+      }),
       Effect.provideContext(stores),
     );
     return { manager, ghCalls };
@@ -6952,3 +6964,486 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 });
+
+type MutableContinuationFixture<T> = { -readonly [K in keyof T]: T[K] };
+
+const continuationFixture = Effect.fn(function* (merge: "squash" | "rebase" | "merge" = "squash") {
+  const root = yield* makeTempDir("t3-continuation-");
+  yield* initRepo(root);
+  const remote = yield* createBareRemote();
+  yield* configureVisibleRemoteUrlWithLocalRewrite(
+    root,
+    "origin",
+    "https://github.com/owner/repo.git",
+    remote,
+  );
+  yield* runGit(root, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+  yield* runGit(root, ["push", "-u", "origin", "main"]);
+  yield* runGit(remote, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+  const before = (yield* runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+  yield* runGit(root, ["switch", "-c", "feature/first"]);
+  NodeFS.writeFileSync(NodePath.join(root, "feature.txt"), "landed feature\n");
+  yield* runGit(root, ["add", "."]);
+  yield* runGit(root, ["commit", "-m", "Feature"]);
+  yield* runGit(root, ["push", "-u", "origin", "feature/first"]);
+  const mergedHead = (yield* runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+  yield* runGit(root, ["switch", "main"]);
+  NodeFS.writeFileSync(NodePath.join(root, "base.txt"), "base advanced\n");
+  yield* runGit(root, ["add", "."]);
+  yield* runGit(root, ["commit", "-m", "Advance base"]);
+  if (merge === "rebase") {
+    yield* runGit(root, ["switch", "-c", "landed-copy", mergedHead]);
+    yield* runGit(root, ["rebase", "main"]);
+    yield* runGit(root, ["switch", "main"]);
+    yield* runGit(root, ["merge", "--ff-only", "landed-copy"]);
+  } else {
+    yield* runGit(root, ["merge", merge === "squash" ? "--squash" : "--no-ff", "feature/first"]);
+    if (merge === "squash") yield* runGit(root, ["commit", "-m", "Squashed feature"]);
+  }
+  NodeFS.writeFileSync(NodePath.join(root, "later.txt"), "new remote dependency\n");
+  yield* runGit(root, ["add", "."]);
+  yield* runGit(root, ["commit", "-m", "Remote advances after merge"]);
+  yield* runGit(root, ["push", "origin", "main"]);
+  const tip = (yield* runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+  yield* runGit(root, ["reset", "--hard", before]);
+  const cwd = NodePath.join(root, "managed", "checkout");
+  yield* runGit(root, ["worktree", "add", cwd, "feature/first"]);
+  const threadId = ThreadId.make("continuation-thread");
+  const thread = {
+    id: threadId,
+    branch: "feature/first",
+    worktreePath: cwd,
+  } as MutableContinuationFixture<import("@t3tools/contracts").OrchestrationV2AppThread>;
+  const pr: MutableContinuationFixture<ChangeRequest> = {
+    provider: SourceControlProviderKind.make("github"),
+    number: 17,
+    title: "First PR",
+    url: "https://github.com/owner/repo/pull/17",
+    baseRefName: "main",
+    headRefName: "feature/first",
+    state: "merged",
+    headSha: mergedHead,
+    isCrossRepository: false,
+    headRepositoryNameWithOwner: "owner/repo",
+    headRepositoryOwnerLogin: "owner",
+    updatedAt: Option.none(),
+  };
+  const owners = [{ threadId, worktreePath: cwd }];
+  const terminalActivity = { busy: false };
+  const runtime = {
+    runs: [],
+    turnItems: [],
+    subagents: [],
+    attempts: [],
+    providerTurns: [],
+    messages: [],
+  } as unknown as MutableContinuationFixture<
+    import("@t3tools/contracts").OrchestrationV2ThreadProjection
+  >;
+  let queries = 0;
+  const fake = createGitHubProviderWithFakeGh().service;
+  const gitCommands: string[] = [];
+  const make = (gitSpawnGate?: NonNullable<Parameters<typeof makeManager>[0]>["gitSpawnGate"]) =>
+    makeManager({
+      ...(gitSpawnGate === undefined ? {} : { gitSpawnGate }),
+      hasWorkspaceSessions: () => Effect.succeed(terminalActivity.busy),
+      serverSettings: {
+        worktreesDirectory: NodePath.join(root, "managed"),
+        newWorktreesStartFromOrigin: false,
+      },
+      sourceControlProvider: {
+        ...fake,
+        listChangeRequests: ({ headSelector }) => {
+          queries++;
+          return Effect.succeed(headSelector.split(":").at(-1) === pr.headRefName ? [pr] : []);
+        },
+        getChangeRequest: () => Effect.succeed({ ...pr }),
+        getDefaultBranch: () => Effect.succeed("main"),
+      },
+      projectionStore: {
+        getThread: () => Effect.succeed({ ...thread }),
+        getThreadWorktreePaths: () => Effect.succeed(owners),
+        getRuntimeRecoveryProjection: () => Effect.succeed(runtime),
+      },
+      gitCommands,
+    });
+  const { manager } = yield* make();
+  const prepare = () =>
+    withWorkspaceLease(cwd, manager.prepareThreadContinuation({ threadId, requestId: "turn-1" }));
+  return {
+    root,
+    remote,
+    cwd,
+    before,
+    mergedHead,
+    tip,
+    threadId,
+    thread,
+    pr,
+    owners,
+    terminalActivity,
+    runtime,
+    manager,
+    prepare,
+    make,
+    gitCommands,
+    queries: () => queries,
+  };
+});
+
+it.effect.each(["squash", "rebase", "merge"] as const)(
+  "prepares post-%s continuation from the fetched tip in the existing checkout",
+  (merge) =>
+    Effect.gen(function* () {
+      const fixture = yield* continuationFixture(merge);
+      const result = yield* fixture.prepare();
+      expect(result.branch).toBe("feature/first-continue-17");
+      expect((yield* runGit(fixture.cwd, ["rev-parse", "HEAD"])).stdout.trim()).toBe(fixture.tip);
+      expect((yield* runGit(fixture.cwd, ["rev-parse", "feature/first"])).stdout.trim()).toBe(
+        fixture.mergedHead,
+      );
+      expect((yield* runGit(fixture.cwd, ["rev-parse", "main"])).stdout.trim()).toBe(
+        fixture.before,
+      );
+      expect(
+        (yield* runGit(fixture.cwd, [
+          "config",
+          `branch.${result.branch}.gh-merge-base`,
+        ])).stdout.trim(),
+      ).toBe("main");
+      expect(NodeFS.readFileSync(NodePath.join(fixture.cwd, "later.txt"), "utf8")).toContain(
+        "new remote dependency",
+      );
+      expect(result.context).toContain(fixture.tip);
+      expect(result.context).toContain("Earlier conversation describes the old checkout");
+      const restarted = (yield* fixture.make()).manager;
+      expect(
+        yield* restarted.prepareThreadContinuation({
+          threadId: fixture.threadId,
+          requestId: "turn-1",
+        }),
+      ).toEqual(result);
+      fixture.thread.branch = result.branch!;
+      expect(
+        yield* restarted.prepareThreadContinuation({
+          threadId: fixture.threadId,
+          requestId: "turn-2",
+        }),
+      ).toMatchObject({ context: expect.stringContaining(fixture.tip) });
+      expect(
+        (yield* runGit(fixture.cwd, ["branch", "--list", "*-continue-*"])).stdout
+          .trim()
+          .split("\n"),
+      ).toHaveLength(1);
+    }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
+it.effect.each(["index", "dirty", "untracked", "commit", "diverged"] as const)(
+  "preserves %s follow-up work and asks the agent to prepare before implementation",
+  (work) =>
+    Effect.gen(function* () {
+      const f = yield* continuationFixture();
+      if (work === "diverged") yield* runGit(f.cwd, ["reset", "--hard", f.before]);
+      NodeFS.writeFileSync(NodePath.join(f.cwd, "follow-up.txt"), "follow-up\n");
+      if (work !== "untracked") yield* runGit(f.cwd, ["add", "follow-up.txt"]);
+      if (work === "dirty" || work === "commit" || work === "diverged")
+        yield* runGit(f.cwd, ["commit", "-m", "Follow-up"]);
+      if (work === "dirty")
+        NodeFS.appendFileSync(NodePath.join(f.cwd, "follow-up.txt"), "unstaged\n");
+      const before = (yield* runGit(f.cwd, ["status", "--porcelain=v1", "--untracked-files=all"]))
+        .stdout;
+      const index = (yield* runGit(f.cwd, ["ls-files", "--stage"])).stdout;
+      const head = (yield* runGit(f.cwd, ["rev-parse", "HEAD"])).stdout;
+      const result = yield* f.prepare();
+      expect(result.branch).toBeUndefined();
+      expect(result.context).toContain("PREPARATION REQUIRED BEFORE IMPLEMENTATION");
+      expect(result.context).toContain(f.tip);
+      expect(result.context).toContain(
+        work === "diverged" ? "ambiguous or rewritten" : "is an ancestor of HEAD",
+      );
+      expect(
+        (yield* runGit(f.cwd, ["status", "--porcelain=v1", "--untracked-files=all"])).stdout,
+      ).toBe(before);
+      expect((yield* runGit(f.cwd, ["ls-files", "--stage"])).stdout).toBe(index);
+      expect((yield* runGit(f.cwd, ["rev-parse", "HEAD"])).stdout).toBe(head);
+      expect(NodeFS.readFileSync(NodePath.join(f.cwd, "follow-up.txt"), "utf8")).toContain(
+        "follow-up",
+      );
+      expect(
+        f.gitCommands.some((command) => /^(?:rebase|cherry-pick|reset|cherry)\b/.test(command)),
+      ).toBe(false);
+    }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
+it.effect.each(["shared", "background", "terminal", "fetch", "base", "fork", "identity"] as const)(
+  "leaves the checkout untouched when continuation is blocked by %s",
+  (reason) =>
+    Effect.gen(function* () {
+      const f = yield* continuationFixture();
+      if (reason === "shared")
+        f.owners.push({ threadId: ThreadId.make("other-thread"), worktreePath: f.cwd });
+      if (reason === "terminal") f.terminalActivity.busy = true;
+      if (reason === "background") f.runtime.turnItems = [{ status: "running" }] as never;
+      if (reason === "fetch") {
+        yield* runGit(f.root, [
+          "config",
+          `url.${f.remote}.insteadOf`,
+          "https://different.example/",
+        ]);
+        yield* runGit(f.root, [
+          "config",
+          "url./missing-continuation-remote.insteadOf",
+          "https://github.com/owner/repo.git",
+        ]);
+      }
+      if (reason === "base") f.pr.baseRefName = "release";
+      if (reason === "fork") f.pr.isCrossRepository = true;
+      if (reason === "identity") f.pr.url = "https://github.com/other/repo/pull/17";
+      const result = yield* Effect.result(f.prepare());
+      expect(result._tag).toBe("Failure");
+      expect((yield* runGit(f.cwd, ["rev-parse", "HEAD"])).stdout.trim()).toBe(f.mergedHead);
+      expect((yield* runGit(f.cwd, ["branch", "--show-current"])).stdout.trim()).toBe(
+        "feature/first",
+      );
+      expect((yield* runGit(f.cwd, ["branch", "--list", "*-continue-*"])).stdout.trim()).toBe("");
+    }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
+it.effect(
+  "guards every commit/PR action and scopes intentional merged-branch reuse to one exact checkout",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* continuationFixture();
+      NodeFS.writeFileSync(NodePath.join(f.cwd, "follow-up.txt"), "pending\n");
+      for (const action of [
+        "commit",
+        "commit_push",
+        "commit_push_pr",
+        "create_pr",
+        "push",
+      ] as const) {
+        const error = yield* f.manager
+          .runStackedAction({
+            cwd: f.cwd,
+            actionId: action,
+            action,
+            featureBranch: action === "commit",
+          })
+          .pipe(Effect.flip);
+        expect(error._tag).toBe("GitContinuationRequiredError");
+      }
+      const token = { branch: "feature/first", pullRequestNumber: 17, headSha: f.mergedHead };
+      expect(
+        yield* f.manager.runStackedAction({
+          cwd: f.cwd,
+          actionId: "manual",
+          action: "commit",
+          commitMessage: "Intentional follow-up",
+          reuseMergedBranch: token,
+        }),
+      ).toMatchObject({ commit: { status: "created" } });
+      const error = yield* f.manager
+        .runStackedAction({
+          cwd: f.cwd,
+          actionId: "again",
+          action: "commit",
+          reuseMergedBranch: token,
+        })
+        .pipe(Effect.flip);
+      expect(error._tag).toBe("GitContinuationRequiredError");
+    }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
+it.effect("does not prepare an open PR or a manually changed branch", () =>
+  Effect.gen(function* () {
+    const f = yield* continuationFixture();
+    f.pr.state = "open";
+    expect(yield* f.prepare()).toEqual({});
+    yield* runGit(f.cwd, ["switch", "-c", "manual-branch"]);
+    const calls = f.queries();
+    const result = yield* f.prepare();
+    expect(result.branch).toBeUndefined();
+    expect(result).toEqual({});
+    expect(f.queries()).toBeGreaterThanOrEqual(calls);
+  }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
+it.effect.each(["branch", "switch"])(
+  "recovers after interruption following git %s without creating another branch",
+  (step) =>
+    Effect.gen(function* () {
+      const f = yield* continuationFixture();
+      const reached = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const gated = (yield* f.make({
+        matches: (args) => args[0] === step && args[1] === "feature/first-continue-17",
+        reached,
+        release,
+      })).manager;
+      const preparing = yield* withWorkspaceLease(
+        f.cwd,
+        gated.prepareThreadContinuation({ threadId: f.threadId, requestId: "turn-1" }),
+      ).pipe(Effect.forkChild);
+      yield* Effect.raceFirst(
+        Deferred.await(reached),
+        Fiber.join(preparing).pipe(
+          Effect.andThen(Effect.die("Preparation did not reach the interruption point.")),
+        ),
+      );
+      yield* Fiber.interrupt(preparing);
+      const result = yield* f.prepare();
+      expect(result.branch).toBe("feature/first-continue-17");
+      expect((yield* runGit(f.cwd, ["rev-parse", "HEAD"])).stdout.trim()).toBe(f.tip);
+      expect(
+        (yield* runGit(f.cwd, ["branch", "--list", "*-continue-*"])).stdout.trim().split("\n"),
+      ).toHaveLength(1);
+    }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
+it.effect("prepares a restored worktree even when the merged remote head was deleted", () =>
+  Effect.gen(function* () {
+    const f = yield* continuationFixture();
+    yield* runGit(f.root, ["worktree", "remove", f.cwd]);
+    yield* runGit(f.root, ["push", "origin", "--delete", "feature/first"]);
+    yield* runGit(f.root, ["worktree", "prune"]);
+    yield* runGit(f.root, ["worktree", "add", f.cwd, "feature/first"]);
+    const result = yield* f.prepare();
+    expect(result.branch).toBe("feature/first-continue-17");
+    expect((yield* runGit(f.cwd, ["rev-parse", "HEAD"])).stdout.trim()).toBe(f.tip);
+  }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
+it.effect(
+  "serializes duplicate preparation and stops replaying context once a provider turn received it",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* continuationFixture();
+      const [one, two] = yield* Effect.all([f.prepare(), f.prepare()], { concurrency: 2 });
+      expect(one).toEqual(two);
+      f.thread.branch = one.branch!;
+      f.runtime.runs = [{ id: RunId.make("turn-1"), ordinal: 1 }] as never;
+      f.runtime.attempts = [{ id: "attempt-1", runId: "turn-1" }] as never;
+      f.runtime.providerTurns = [{ runAttemptId: "attempt-1" }] as never;
+      expect(
+        yield* f.manager.prepareThreadContinuation({ threadId: f.threadId, requestId: "turn-2" }),
+      ).toEqual({});
+      expect(
+        yield* f.manager.prepareThreadContinuation({ threadId: f.threadId, requestId: "turn-3" }),
+      ).toEqual({});
+    }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
+it.effect.each(["shared", "head", "untracked", "binding", "terminal", "host"] as const)(
+  "rechecks %s after fetching before any checkout mutation",
+  (change) =>
+    Effect.gen(function* () {
+      const f = yield* continuationFixture();
+      const reached = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const gated = (yield* f.make({ matches: (args) => args[0] === "fetch", reached, release }))
+        .manager;
+      const preparing = yield* withWorkspaceLease(
+        f.cwd,
+        gated.prepareThreadContinuation({ threadId: f.threadId, requestId: "turn-1" }),
+      ).pipe(Effect.result, Effect.forkChild);
+      yield* Effect.raceFirst(
+        Deferred.await(reached),
+        Fiber.join(preparing).pipe(Effect.andThen(Effect.die("Fetch did not run."))),
+      );
+      if (change === "shared")
+        f.owners.push({ threadId: ThreadId.make("other"), worktreePath: f.cwd });
+      if (change === "head") {
+        NodeFS.writeFileSync(NodePath.join(f.cwd, "later-work.txt"), "keep me\n");
+        yield* runGit(f.cwd, ["add", "."]);
+        yield* runGit(f.cwd, ["commit", "-m", "Concurrent work"]);
+      }
+      if (change === "untracked")
+        NodeFS.writeFileSync(NodePath.join(f.cwd, "untracked.txt"), "keep me\n");
+      if (change === "binding") f.thread.branch = "manually-selected";
+      if (change === "terminal") f.terminalActivity.busy = true;
+      if (change === "host") f.pr.state = "open";
+      const head = (yield* runGit(f.cwd, ["rev-parse", "HEAD"])).stdout;
+      const status = (yield* runGit(f.cwd, ["status", "--porcelain=v1", "--untracked-files=all"]))
+        .stdout;
+      yield* Deferred.succeed(release, undefined);
+      expect((yield* Fiber.join(preparing))._tag).toBe("Failure");
+      expect((yield* runGit(f.cwd, ["rev-parse", "HEAD"])).stdout).toBe(head);
+      expect(
+        (yield* runGit(f.cwd, ["status", "--porcelain=v1", "--untracked-files=all"])).stdout,
+      ).toBe(status);
+      expect((yield* runGit(f.cwd, ["branch", "--show-current"])).stdout.trim()).toBe(
+        "feature/first",
+      );
+    }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
+it.effect("retains the checkout when fetch fails after resolving the remote default branch", () =>
+  Effect.gen(function* () {
+    const f = yield* continuationFixture();
+    const reached = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const gated = (yield* f.make({ matches: (args) => args[0] === "ls-remote", reached, release }))
+      .manager;
+    const preparing = yield* withWorkspaceLease(
+      f.cwd,
+      gated.prepareThreadContinuation({ threadId: f.threadId, requestId: "turn-1" }),
+    ).pipe(Effect.result, Effect.forkChild);
+    yield* Deferred.await(reached);
+    yield* runGit(f.root, ["config", `url.${f.remote}.insteadOf`, "https://other.example/"]);
+    yield* runGit(f.root, [
+      "config",
+      "url./missing-remote.insteadOf",
+      "https://github.com/owner/repo.git",
+    ]);
+    yield* Deferred.succeed(release, undefined);
+    const result = yield* Fiber.join(preparing);
+    expect(result._tag).toBe("Failure");
+    expect(f.gitCommands.some((command) => command.startsWith("fetch "))).toBe(true);
+    expect((yield* runGit(f.cwd, ["rev-parse", "HEAD"])).stdout.trim()).toBe(f.mergedHead);
+    expect((yield* runGit(f.cwd, ["branch", "--show-current"])).stdout.trim()).toBe(
+      "feature/first",
+    );
+  }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
+it.effect(
+  "requires explicit preparation for a detached checkout or a changed remote default branch",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* continuationFixture();
+      yield* runGit(f.cwd, ["switch", "--detach", f.mergedHead]);
+      const detached = yield* f.prepare().pipe(Effect.flip);
+      expect(detached.message).toContain("detached HEAD");
+      expect((yield* runGit(f.cwd, ["rev-parse", "HEAD"])).stdout.trim()).toBe(f.mergedHead);
+      yield* runGit(f.cwd, ["switch", "feature/first"]);
+      yield* runGit(f.root, ["push", "origin", "main:release"]);
+      yield* runGit(f.remote, ["symbolic-ref", "HEAD", "refs/heads/release"]);
+      const changed = yield* f.prepare().pipe(Effect.flip);
+      expect(changed.message).toContain("default-branch base");
+      expect((yield* runGit(f.cwd, ["branch", "--show-current"])).stdout.trim()).toBe(
+        "feature/first",
+      );
+    }).pipe(Effect.provide(layerGitManagerTest)),
+);
+
+it.effect(
+  "retains undelivered checkout context after a prepared worktree is removed and restored",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* continuationFixture();
+      const prepared = yield* f.prepare();
+      f.thread.branch = prepared.branch!;
+      yield* runGit(f.root, ["worktree", "remove", f.cwd]);
+      yield* runGit(f.root, ["worktree", "prune"]);
+      yield* runGit(f.root, ["worktree", "add", f.cwd, prepared.branch!]);
+      const restarted = (yield* f.make()).manager;
+      const retry = yield* restarted.prepareThreadContinuation({
+        threadId: f.threadId,
+        requestId: "retry-turn",
+      });
+      expect(retry.context).toContain(f.tip);
+      expect(retry.context).toContain("Earlier conversation describes the old checkout");
+      expect(retry.branch).toBeUndefined();
+      expect((yield* runGit(f.cwd, ["rev-parse", "HEAD"])).stdout.trim()).toBe(f.tip);
+    }).pipe(Effect.provide(layerGitManagerTest)),
+);

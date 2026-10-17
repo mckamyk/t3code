@@ -1,8 +1,11 @@
+import { ThreadId } from "./baseSchemas.ts";
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
 import {
   VcsCreateWorktreeInput,
+  GitContinuationRequiredError,
+  GitManagerServiceError,
   GitPreparePullRequestThreadInput,
   GitPreparePullRequestThreadResult,
   GitRunStackedActionResult,
@@ -10,6 +13,11 @@ import {
   GitResolvePullRequestResult,
   VcsStatusLocalResult,
 } from "./git.ts";
+
+const gitErrorWire = Schema.fromJsonString(GitManagerServiceError);
+const encodeGitError = Schema.encodeSync(gitErrorWire);
+const decodeGitError = Schema.decodeUnknownSync(gitErrorWire);
+const isContinuationError = Schema.is(GitContinuationRequiredError);
 
 const decodeCreateWorktreeInput = Schema.decodeUnknownSync(VcsCreateWorktreeInput);
 const decodePreparePullRequestThreadInput = Schema.decodeUnknownSync(
@@ -231,5 +239,39 @@ describe("GitRunStackedActionResult", () => {
     if (parsed.toast.cta.kind === "run_action") {
       expect(parsed.toast.cta.action.kind).toBe("create_pr");
     }
+  });
+});
+
+it("round-trips actionable continuation feedback and scopes manual reuse to the supplied branch, PR and HEAD", () => {
+  const error = new GitContinuationRequiredError({
+    cwd: "/repo/worktree",
+    threadId: ThreadId.make("thread"),
+    branch: "feature/first",
+    pullRequestNumber: 17,
+    headSha: "abc123",
+  });
+  const wire = encodeGitError(error);
+  const restored = decodeGitError(wire);
+  expect(isContinuationError(restored)).toBe(true);
+  expect(restored).toMatchObject({
+    threadId: "thread",
+    branch: "feature/first",
+    pullRequestNumber: 17,
+    headSha: "abc123",
+  });
+  const input = decodeRunStackedActionInput({
+    actionId: "explicit-reuse",
+    cwd: "/repo/worktree",
+    action: "commit",
+    reuseMergedBranch: {
+      branch: error.branch,
+      pullRequestNumber: error.pullRequestNumber,
+      headSha: error.headSha,
+    },
+  });
+  expect(input.reuseMergedBranch).toMatchObject({
+    branch: "feature/first",
+    pullRequestNumber: 17,
+    headSha: "abc123",
   });
 });

@@ -379,6 +379,10 @@ const threadWorktreePathsReadActiveThreads = Effect.gen(function* () {
   assert.deepEqual(yield* store.getThreadWorktreePaths(), [
     { threadId: ThreadId.make("thread:active"), worktreePath: "/worktrees/active" },
   ]);
+  assert.deepEqual(yield* store.getThreadWorktreePaths({ includeArchived: true }), [
+    { threadId: ThreadId.make("thread:active"), worktreePath: "/worktrees/active" },
+    { threadId: ThreadId.make("thread:archived"), worktreePath: "/worktrees/archived" },
+  ]);
 });
 
 const commandReadsSkipSettledLeafNodes = Effect.gen(function* () {
